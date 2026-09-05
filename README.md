@@ -1,3 +1,95 @@
+# Hybrid Daft Punk Renderer
+
+## Watch And Explore
+
+The live GPU viewer plays a seamless 24-second smoke and laser show on repeat. Move the camera while it plays, or pause the scene and inspect it from any angle. No video export or frame-by-frame CPU rendering is needed.
+
+On macOS, install GLFW if needed (`brew install glfw`), then run:
+
+```sh
+cmake -S . -B build-renderer -DRENDERER_ONLY=ON -DBUILD_LIVE_VIEWER=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-renderer --config Release
+./build-renderer/daftpunk_live
+```
+
+| Control | Action |
+| --- | --- |
+| Left-button drag or arrow keys | Orbit the camera around the helmet |
+| Mouse wheel / two-finger vertical scroll | Zoom in or out |
+| `Space` | Pause/resume the show and automatic camera movement; manual camera controls still work |
+| `A` | Toggle automatic camera orbit for hands-free viewing |
+| `R` | Reset camera and restart the show |
+| `Q` | Switch fast/high-quality smoke rendering |
+| `Esc` or close window | Quit |
+
+The window is resizable; its title shows playback state, quality, FPS, and controls. Dragging or using arrow keys stops automatic orbit. The shader is embedded in the executable at build time, so the viewer can be launched from any directory.
+
+The live viewer requires a graphical desktop, OpenGL 3.3, and GLFW. Non-macOS builds additionally need GLEW. The CPU renderer remains available without these dependencies: use `-DBUILD_LIVE_VIEWER=OFF` for a CPU-only build. On multi-configuration generators, executables are under `build-renderer/Release/`.
+
+To run the GPU checks or capture a still from the live renderer:
+
+```sh
+./build-renderer/daftpunk_live --smoke-test
+./build-renderer/daftpunk_live --snapshot live-preview.ppm
+```
+
+GPU checks require a graphical session even though their window is hidden. They verify the loop boundary, changing animation/camera views, both quality modes, and framebuffer values. They are separate from CTest so headless CPU builds do not require a display.
+
+## CPU Still Renderer
+
+Render a half-gold, half-chrome Daft Punk-inspired helmet with reflective materials, wraparound and slit visors, ear housings, colored laser fans, low-lying procedural smoke, and a reflective stage. This CPU still renderer uses only the C++20 standard library. The renderer-only build requires CMake 3.22 or newer and a C++20 compiler, but no external libraries, vcpkg, or OpenGL.
+
+## Dependency-Free Build
+
+Run from the repository root:
+
+```sh
+cmake -S . -B build-renderer -DRENDERER_ONLY=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-renderer --config Release
+```
+
+`RENDERER_ONLY` defaults to `OFF`. Enabling it builds `daftpunk_lasershow` and its regression checks, skipping the starter project's external dependencies and other targets. Pass `-DBUILD_TESTING=OFF` to omit the checks.
+
+```sh
+ctest --test-dir build-renderer -C Release --output-on-failure
+```
+
+## Render Still Images
+
+Quick preview:
+
+```sh
+./build-renderer/daftpunk_lasershow --width 480 --samples 1 --output preview.ppm
+```
+
+Higher quality:
+
+```sh
+./build-renderer/daftpunk_lasershow --width 1920 --samples 9 --output daftpunk.ppm
+```
+
+For multi-configuration generators such as Visual Studio or Xcode, the executable is under `build-renderer/Release/` instead (with an `.exe` suffix on Windows).
+
+| Option | Description | Default |
+| --- | --- | --- |
+| `--width integer` | Image width; accepts 64 through 3840. | `960` |
+| `--samples integer` | Sampling quality; accepts 1 through 16. | `4` |
+| `--time float` | Finite scene time within +/-100000 seconds; varies smoke and laser positions. | `0` |
+| `--output path` | Write the PPM image to this path. | PPM to standard output |
+| `--help` | Display command-line help. | |
+
+`--time` selects a frame to render in the CPU still renderer. For interactive playback use `daftpunk_live` above. If `--output` is omitted, redirect standard output to a `.ppm` file. The GPU viewer uses a cheaper noise function and periodic motion, so its frames are not pixel-identical to the CPU renderer.
+
+On macOS, convert the PPM image to PNG with `sips`:
+
+```sh
+sips -s format png daftpunk.ppm --out daftpunk.png
+```
+
+# Original Starter Instructions
+
+The instructions below apply to the original starter build with `RENDERER_ONLY=OFF`.
+
 This project uses CMake and vcpkg for managing C++ dependencies. It serves as a simple example to test your build setup before we get into more complicted code.
 
 ## Building Using CMake Presets
@@ -125,4 +217,3 @@ Then, when you restart your terminals, you should be able to run the vcpkg progr
 ```
 vcpkg
 ```
-

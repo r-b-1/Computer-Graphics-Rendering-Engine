@@ -1,0 +1,4 @@
+#pragma once
+inline constexpr const char* scene_shader = R"GLSL(
+@LIVE_SCENE_SHADER@
+)GLSL";

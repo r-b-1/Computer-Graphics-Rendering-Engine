@@ -41,6 +41,33 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(BUILD_LIVE_VIEWER "Build the animated OpenGL viewer (requires GLFW)" OFF)
+if(BUILD_LIVE_VIEWER)
+  find_package(OpenGL REQUIRED)
+  find_package(glfw3 CONFIG REQUIRED)
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/live_scene.frag" LIVE_SCENE_SHADER)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/live_scene.frag)
+  configure_file(src/live_shader.h.in generated/live_shader.h @ONLY)
+  add_executable(daftpunk_live src/live_viewer.cpp)
+  target_include_directories(daftpunk_live PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  target_link_libraries(daftpunk_live PRIVATE glfw OpenGL::GL)
+  if(NOT APPLE)
+    find_package(GLEW REQUIRED)
+    target_link_libraries(daftpunk_live PRIVATE GLEW::GLEW)
+  endif()
+endif()
+
+option(RENDERER_ONLY "Build only the dependency-free CPU still renderer" OFF)
+if(RENDERER_ONLY)
+  add_executable(daftpunk_lasershow src/main.cc)
+  include(CTest)
+  if(BUILD_TESTING)
+    add_executable(renderer_checks utests/renderer_checks.cpp)
+    add_test(NAME renderer_checks COMMAND renderer_checks)
+  endif()
+  return()
+endif()
+
 # --------------------------------------------------------------------
 # PNG and ZLIB
 #
