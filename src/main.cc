@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
-#include <random>
 
 namespace {
 
@@ -17,22 +16,7 @@ vec3 reflect(const vec3& v, const vec3& n) {
     return v - 2.0f * dot(v, n) * n;
 }
 
-vec3 refract(const vec3& uv, const vec3& n, float etai_over_etat) {
-    auto cos_theta = std::fmin(dot(-uv, n), 1.0f);
-    vec3 r_out_perp = etai_over_etat * (uv + cos_theta * n);
-    vec3 r_out_parallel = -std::sqrt(std::fmax(0.0f, 1.0f - r_out_perp.length_squared())) * n;
-    return r_out_perp + r_out_parallel;
-}
-
-// Schlick approximation for Fresnel reflectance.
-float schlick(float cosine, float ref_idx) {
-    auto r0 = (1.0f - ref_idx) / (1.0f + ref_idx);
-    r0 = r0 * r0;
-    return r0 + (1.0f - r0) * std::pow((1.0f - cosine), 5.0f);
-}
-
-// Cheap procedural noise (hash-based) for fog. Not pretty, but enough
-// to make the smoke show feel cloudy.
+// Cheap procedural hash.
 float hash13(vec3 p) {
     p = vec3(
         std::fmod(std::sin(dot(p, vec3(127.1f, 311.7f, 74.7f))) * 43758.5453f, 1.0f),
@@ -41,16 +25,41 @@ float hash13(vec3 p) {
     return std::fmod(p.x() + p.y() + p.z(), 1.0f);
 }
 
+float value_noise(vec3 p) {
+    vec3 i(std::floor(p.x()), std::floor(p.y()), std::floor(p.z()));
+    vec3 f(p.x() - i.x(), p.y() - i.y(), p.z() - i.z());
+    vec3 u(f.x() * f.x() * (3 - 2 * f.x()),
+           f.y() * f.y() * (3 - 2 * f.y()),
+           f.z() * f.z() * (3 - 2 * f.z()));
+    float n000 = hash13(i);
+    float n100 = hash13(i + vec3(1, 0, 0));
+    float n010 = hash13(i + vec3(0, 1, 0));
+    float n110 = hash13(i + vec3(1, 1, 0));
+    float n001 = hash13(i + vec3(0, 0, 1));
+    float n101 = hash13(i + vec3(1, 0, 1));
+    float n011 = hash13(i + vec3(0, 1, 1));
+    float n111 = hash13(i + vec3(1, 1, 1));
+    return (
+        n000 * (1 - u.x()) * (1 - u.y()) * (1 - u.z()) +
+        n100 * u.x()       * (1 - u.y()) * (1 - u.z()) +
+        n010 * (1 - u.x()) * u.y()       * (1 - u.z()) +
+        n110 * u.x()       * u.y()       * (1 - u.z()) +
+        n001 * (1 - u.x()) * (1 - u.y()) * u.z()       +
+        n101 * u.x()       * (1 - u.y()) * u.z()       +
+        n011 * (1 - u.x()) * u.y()       * u.z()       +
+        n111 * u.x()       * u.y()       * u.z()
+    );
+}
+
+// Smoke density: low-frequency layered noise so the room is hazy near the
+// ground and clear above the helmet. Cheap to evaluate (no trilinear noise).
 float fog_density(const vec3& p) {
-    // Layered low-frequency "smoke". A few sin fields plus a hash jitter
-    // give the volumetric beams something to scatter through.
-    float n = 0.0f;
-    n += 0.50f * std::sin(0.9f * p.x() + 0.4f * p.y());
-    n += 0.30f * std::sin(1.3f * p.y() - 0.7f * p.z());
-    n += 0.20f * std::sin(0.6f * p.z() + 1.1f * p.x());
-    n += 0.15f * (hash13(p * 3.7f) - 0.5f);
-    n = (n + 1.0f) * 0.5f; // [0,1]
-    return std::fmax(0.0f, n - 0.05f); // keep the room filled with haze
+    float low = std::fmax(0.0f, 1.0f - (p.y() + 1.5f) * 0.40f);
+    float n = 0.5f + 0.5f * std::sin(0.7f * p.x() + 0.3f * p.y()) *
+                       std::sin(0.9f * p.y() - 0.5f * p.z()) *
+                       std::sin(0.4f * p.z() + 0.6f * p.x());
+    n += 0.10f * (hash13(p * 2.7f) - 0.5f);
+    return std::fmax(0.0f, n - 0.10f) * low;
 }
 
 // -----------------------------------------------------------------------------
@@ -61,26 +70,65 @@ struct hit_record {
     float t;
     vec3 p;
     vec3 normal;
-    int material; // 0 = left helmet (gold), 1 = right helmet (chrome), 2 = visor, 3 = ground
+    int material; // 0 = gold, 1 = chrome, 2 = visor, 3 = mouth slit, 4 = ground
 };
 
-bool hit_sphere(const point3& center, float radius, const ray& r, float t_min, float t_max, hit_record& rec, int material) {
-    vec3 oc = r.origin() - center;
-    auto a = r.direction().length_squared();
-    auto h = dot(r.direction(), oc);
-    auto c = oc.length_squared() - radius * radius;
-    auto discriminant = h * h - a * c;
-    if (discriminant < 0) return false;
-    auto sqd = std::sqrt(discriminant);
+// Ellipsoid = sphere stretched by scale, then translated. We transform the
+// ray into the sphere's local frame, intersect the unit sphere, then map back.
+struct ellipsoid {
+    vec3 center;
+    vec3 scale;   // half-extents in each axis
+};
+
+bool hit_ellipsoid(const ellipsoid& e, const ray& r, float t_min, float t_max, hit_record& rec, int material_floor, int material_ceiling) {
+    vec3 inv_scale(1.0f / e.scale.x(), 1.0f / e.scale.y(), 1.0f / e.scale.z());
+    vec3 local_o = (r.origin() - e.center) * inv_scale;
+    vec3 local_d = r.direction() * inv_scale;
+
+    vec3 oc = local_o;
+    auto a = local_d.length_squared();
+    auto h = dot(local_d, oc);
+    auto c = oc.length_squared() - 1.0f;
+    auto disc = h * h - a * c;
+    if (disc < 0) return false;
+    auto sqd = std::sqrt(disc);
     auto root = (-h - sqd) / a;
     if (root < t_min || root > t_max) {
         root = (-h + sqd) / a;
         if (root < t_min || root > t_max) return false;
     }
+
     rec.t = root;
     rec.p = r.at(root);
-    rec.normal = (rec.p - center) / radius;
-    rec.material = material;
+
+    vec3 grad(rec.p.x() - e.center.x(),
+              rec.p.y() - e.center.y(),
+              rec.p.z() - e.center.z());
+    grad = vec3(grad.x() / (e.scale.x() * e.scale.x()),
+                grad.y() / (e.scale.y() * e.scale.y()),
+                grad.z() / (e.scale.z() * e.scale.z()));
+    rec.normal = unit_vector(grad);
+
+    float y = rec.p.y();
+    bool front_facing = rec.normal.z() > 0.3f;
+    if (front_facing) {
+        if (y > 0.00f && y < 0.18f) {
+            rec.material = 2; // visor
+            return true;
+        }
+        if (y > -0.32f && y < -0.24f && std::fabs(rec.p.x()) < 0.22f) {
+            rec.material = 3; // mouth slit
+            return true;
+        }
+    }
+    if (rec.p.x() < 0) {
+        rec.material = 0;
+    } else if (rec.p.x() > 0) {
+        rec.material = 1;
+    } else {
+        rec.material = 0;
+    }
+    (void)material_floor; (void)material_ceiling;
     return true;
 }
 
@@ -96,88 +144,14 @@ bool hit_plane(const point3& origin, const vec3& normal, float t_min, float t_ma
     return true;
 }
 
-// Intersect a slightly squashed sphere (ellipsoid) for the helmet.
-// We solve the quadratic in the ray's own parameter and pick the nearest root.
-bool hit_helmet(const ray& r, float t_min, float t_max, hit_record& rec) {
-    point3 center(0, 0, -1.2f);
-    // Squash the ray's Y component (taller than wide is wrong; we want wider, so
-    // we scale the ray's y component to 0.95 of a perfect sphere).
-    ray rs(r.origin() * vec3(1, 1.0f/0.95f, 1), r.direction() * vec3(1, 1.0f/0.95f, 1));
-    float radius = 0.85f;
-    vec3 oc = rs.origin() - center;
-    auto a = rs.direction().length_squared();
-    auto h = dot(rs.direction(), oc);
-    auto c = oc.length_squared() - radius * radius;
-    auto discriminant = h * h - a * c;
-    if (discriminant < 0) return false;
-    auto sqd = std::sqrt(discriminant);
-    auto root = (-h - sqd) / a;
-    if (root < t_min || root > t_max) {
-        root = (-h + sqd) / a;
-        if (root < t_min || root > t_max) return false;
-    }
-
-    rec.t = root;
-    rec.p = r.at(root);
-    // Ellipsoid normal: transform the sphere normal back through the same
-    // anisotropic scale, then normalize.
-    vec3 sphere_normal = (rec.p - center) * vec3(1, 0.95f, 1);
-    rec.normal = unit_vector(sphere_normal);
-
-    if (rec.p.x() < 0) {
-        rec.material = 0; // gold (Guy-Manuel)
-    } else if (rec.p.x() > 0) {
-        rec.material = 1; // chrome (Thomas)
-    } else {
-        rec.material = 0; // seam -> gold
-    }
-    return true;
-}
-
-// Visor: a flat horizontal band on the front of the helmet. Implemented as
-// a thin Y-slab intersected with a circular front face.
-bool hit_visor(const ray& r, float t_min, float t_max, hit_record& rec) {
-    // Slight downward offset so the band sits where the eyes would be.
-    float visor_y = -0.05f;
-    float visor_z = -0.40f;
-    float visor_r = 0.22f;
-    float half_thick = 0.025f;
-
-    auto dy = r.direction().y();
-    if (std::fabs(dy) < 1e-6f) return false;
-    auto t_top = ((visor_y + half_thick) - r.origin().y()) / dy;
-    auto t_bot = ((visor_y - half_thick) - r.origin().y()) / dy;
-    auto t_enter = std::fmin(t_top, t_bot);
-    auto t_exit  = std::fmax(t_top, t_bot);
-    if (t_exit < t_min || t_enter > t_max) return false;
-    auto t = (t_enter < t_min) ? t_min : t_enter;
-    if (t < t_min || t > t_max) return false;
-
-    auto p = r.at(t);
-    auto dxz = vec3(p.x(), 0, p.z() - visor_z);
-    if (dxz.length_squared() > visor_r * visor_r) return false;
-
-    // Only keep the front-facing half (closer to camera than visor center).
-    if (p.z() < visor_z) return false;
-
-    rec.t = t;
-    rec.p = p;
-    rec.normal = vec3(0, 0, 1);
-    rec.material = 2;
-    return true;
-}
-
-bool hit_ground(const ray& r, float t_min, float t_max, hit_record& rec) {
-    return hit_plane(point3(0, -1.05f, 0), vec3(0, 1, 0), t_min, t_max, r, rec, 3);
-}
+const ellipsoid kHelmet = { vec3(0, 0.05f, -1.3f), vec3(1.05f, 0.95f, 1.05f) };
 
 bool hit_world(const ray& r, float t_min, float t_max, hit_record& rec) {
     bool hit_anything = false;
     float closest = t_max;
     hit_record tmp;
-    if (hit_helmet(r, t_min, closest, tmp))           { hit_anything = true; closest = tmp.t; rec = tmp; }
-    if (hit_visor(r,  t_min, closest, tmp))           { hit_anything = true; closest = tmp.t; rec = tmp; }
-    if (hit_ground(r, t_min, closest, tmp))           { hit_anything = true; closest = tmp.t; rec = tmp; }
+    if (hit_ellipsoid(kHelmet, r, t_min, closest, tmp, 0, 1)) { hit_anything = true; closest = tmp.t; rec = tmp; }
+    if (hit_plane(point3(0, -1.10f, 0), vec3(0, 1, 0), t_min, closest, r, tmp, 4)) { hit_anything = true; closest = tmp.t; rec = tmp; }
     return hit_anything;
 }
 
@@ -185,30 +159,22 @@ bool hit_world(const ray& r, float t_min, float t_max, hit_record& rec) {
 // Materials
 // -----------------------------------------------------------------------------
 
-// Diffuse + tinted ambient. Stable random-in-unit-sphere for soft shadows
-// would be nice, but the show works without full path tracing.
-color shade_lambert(const hit_record& rec, const vec3& base, const vec3& light_dir) {
-    float ndotl = std::fmax(0.0f, dot(rec.normal, light_dir));
-    vec3 ambient = 0.35f * base;
-    vec3 diffuse = ndotl * base * 1.4f;
-    return ambient + diffuse;
-}
-
-// Cheap "metallic" look: diffuse base plus a few specular highlights.
-// The base color carries the gold vs chrome identity; the highlights
-// just give the helmet shape.
 color shade_metal(const hit_record& rec, const vec3& tint) {
-    // Diffuse-ish term: a soft top light so the helmet has obvious shading.
-    vec3 key_light = unit_vector(vec3(0.4f, 0.8f, 0.5f));
-    vec3 fill_light = unit_vector(vec3(-0.6f, 0.3f, 0.5f));
+    // Stage lights in front of the helmet.
+    vec3 key_light  = unit_vector(vec3( 0.4f,  0.8f,  0.5f));
+    vec3 fill_light = unit_vector(vec3(-0.6f,  0.3f,  0.5f));
+    vec3 back_light = unit_vector(vec3( 0.0f, -0.2f,  1.0f));
     float kd_key  = std::fmax(0.0f, dot(rec.normal, key_light));
     float kd_fill = std::fmax(0.0f, dot(rec.normal, fill_light));
+    float kd_back = std::fmax(0.0f, dot(rec.normal, back_light));
 
-    // A couple of bright specular highlights for the "polished metal" look.
-    vec3 spec_lights[3] = {
+    color base = tint * (0.30f + 1.20f * kd_key + 0.40f * kd_fill + 0.20f * kd_back);
+
+    // Specular highlights.
+    vec3 spec_dirs[3] = {
         unit_vector(vec3( 0.5f,  0.7f,  0.5f)),
         unit_vector(vec3(-0.4f,  0.4f,  0.6f)),
-        unit_vector(vec3( 0.0f, -0.2f,  1.0f)),
+        unit_vector(vec3( 0.0f, -0.3f,  1.0f)),
     };
     color spec_cols[3] = {
         color(1.0f, 0.95f, 0.85f),
@@ -217,12 +183,10 @@ color shade_metal(const hit_record& rec, const vec3& tint) {
     };
     color spec_accum(0, 0, 0);
     for (int i = 0; i < 3; ++i) {
-        vec3 r = reflect(-spec_lights[i], rec.normal);
-        float spec = std::pow(std::fmax(0.0f, r.z()), 16.0f);
-        spec_accum += tint * spec_cols[i] * spec * 1.4f;
+        vec3 r = reflect(-spec_dirs[i], rec.normal);
+        float spec = std::pow(std::fmax(0.0f, r.z()), 12.0f);
+        spec_accum += tint * spec_cols[i] * spec * 1.6f;
     }
-
-    color base = tint * (0.30f + 1.10f * kd_key + 0.45f * kd_fill);
     return base + spec_accum;
 }
 
@@ -231,99 +195,85 @@ color shade_gold(const hit_record& rec) {
 }
 
 color shade_chrome(const hit_record& rec) {
-    return shade_metal(rec, color(0.85f, 0.88f, 0.95f));
+    return shade_metal(rec, color(0.88f, 0.90f, 0.95f));
 }
 
 color shade_visor(const hit_record& rec, const vec3& view_dir) {
-    // Glossy black visor with a thin specular streak along the top.
+    // Glossy black visor with a thin specular streak.
     vec3 light_dir = unit_vector(vec3(0.4f, 0.6f, 0.7f));
     float spec = std::pow(std::fmax(0.0f, dot(reflect(-light_dir, rec.normal), -view_dir)), 60.0f);
-    color base(0.02f, 0.02f, 0.03f);
-    return base + spec * color(0.6f, 0.7f, 0.9f);
+    color base(0.015f, 0.015f, 0.025f);
+    return base + spec * color(0.5f, 0.6f, 0.85f);
+}
+
+color shade_mouth(const hit_record& rec) {
+    // Deep dark slit. Just a slightly lighter black than the visor.
+    return color(0.005f, 0.005f, 0.008f);
 }
 
 color shade_ground(const hit_record& rec) {
-    // Dark dance floor that catches a little light.
-    vec3 light_dir = unit_vector(vec3(0.4f, 0.6f, -0.7f));
-    return shade_lambert(rec, color(0.08f, 0.08f, 0.10f), light_dir);
+    // Dark dance floor. Soft Lambert with the key light.
+    vec3 key = unit_vector(vec3(0.4f, 0.8f, 0.5f));
+    float kd = std::fmax(0.0f, dot(rec.normal, key));
+    return color(0.05f, 0.05f, 0.06f) * (0.4f + 0.8f * kd);
 }
 
 // -----------------------------------------------------------------------------
-// Lasers
+// Lasers / volumetric
 // -----------------------------------------------------------------------------
 
 struct laser_beam {
     point3 origin;
     vec3 direction;
     color color;
-    float radius;   // beam radius in world units
+    float radius;
     float intensity;
 };
 
-// A small fixed light direction used everywhere for cheap shading.
-const vec3 kKeyLight = unit_vector(vec3(0.4f, 0.6f, -0.7f));
-
-// Distance from point p to the infinite line defined by (origin, direction).
-float distance_to_line(const point3& origin, const vec3& direction, const point3& p) {
-    return cross(p - origin, unit_vector(direction)).length();
+vec3 closest_point_on_line(const point3& a, const vec3& adir, const point3& p) {
+    return a + std::fmax(0.0f, dot(p - a, adir)) * adir;
 }
 
-// For a given beam, compute the closest approach between the camera ray
-// and the beam's line. Returns the param t on the camera ray, the distance
-// from the camera ray to the beam line at that t, and the param s on the
-// beam line.
-void closest_approach_ray_line(const ray& r, const point3& b0, const vec3& bdir,
-                               float& t_ray, float& d_min, float& s_beam) {
-    // Minimize ||r.origin + t*r.dir - (b0 + s*bdir)||^2 over t, s.
-    vec3 w0 = r.origin() - b0;
-    float a = dot(r.direction(), r.direction());
-    float b = dot(r.direction(), bdir);
-    float c = dot(bdir, bdir);
-    float d = dot(r.direction(), w0);
-    float e = dot(bdir, w0);
-    float denom = a * c - b * b;
-    if (std::fabs(denom) < 1e-6f) {
-        t_ray = 0; s_beam = 0; d_min = w0.length();
-        return;
-    }
-    t_ray = (b * e - c * d) / denom;
-    s_beam = (a * e - b * d) / denom;
-    vec3 closest = w0 + t_ray * r.direction() - s_beam * bdir;
-    d_min = closest.length();
+float distance_to_line(const point3& a, const vec3& adir, const point3& p) {
+    return (p - closest_point_on_line(a, adir, p)).length();
 }
 
-// Add volumetric laser light for a single beam. The closest approach
-// to the camera ray determines how much the beam contributes; the beam
-// fades with the distance to that closest point.
-color sample_beam(const ray& r, float t_near, float t_far, const laser_beam& beam) {
-    float t_ray, d_min, s_beam;
-    closest_approach_ray_line(r, beam.origin, beam.direction, t_ray, d_min, s_beam);
-    if (d_min >= beam.radius) return color(0, 0, 0);
-    if (t_ray < t_near || t_ray > t_far) return color(0, 0, 0);
-
-    // Radial falloff across the beam.
-    float radial = 1.0f - d_min / beam.radius;
-    radial = radial * radial;
-
-    // Distance from the beam origin to the closest point: how much the beam
-    // has already "burned down" by the time the ray crosses it.
-    vec3 closest_pt = beam.origin + s_beam * beam.direction;
-    float along = std::fmax(0.0f, s_beam);
-    float length_falloff = std::exp(-along * 0.05f);
-
-    // Length of camera-ray segment within the beam's radius: makes wide beams
-    // look brighter than skinny ones.
-    float half_chord = std::sqrt(std::fmax(0.0f, beam.radius * beam.radius - d_min * d_min));
-    float chord = 2.0f * half_chord;
-
-    return beam.color * (radial * length_falloff * beam.intensity * chord);
-}
-
-color accumulate_lasers(const ray& r, float t_near, float t_far,
+// March along the ray from t_near to t_far. At each step compute the
+// in-scattered light from every beam: fog_density * beam radial falloff.
+color volumetric_lasers(const ray& r, float t_near, float t_far,
                         const std::vector<laser_beam>& lasers) {
+    if (t_far <= t_near) return color(0, 0, 0);
+    const int steps = 80;
+    float dt = (t_far - t_near) / float(steps);
+    color result(0, 0, 0);
+    for (int i = 0; i < steps; ++i) {
+        float t = t_near + (i + 0.5f) * dt;
+        if (t <= 0.0f) continue;
+        vec3 p = r.at(t);
+        float fog = fog_density(p);
+        if (fog <= 0.001f) continue;
+        for (const auto& beam : lasers) {
+            float d = distance_to_line(beam.origin, beam.direction, p);
+            if (d >= beam.radius) continue;
+            float radial = 1.0f - d / beam.radius;
+            radial = radial * radial;
+            float along = std::fmax(0.0f, dot(p - beam.origin, beam.direction));
+            float length_falloff = std::exp(-along * 0.04f);
+            result += beam.color * (radial * length_falloff * fog * beam.intensity * dt);
+        }
+    }
+    return result;
+}
+
+// Surface light from a laser painting the hit point.
+color laser_surface_light(const hit_record& rec, const std::vector<laser_beam>& lasers) {
     color result(0, 0, 0);
     for (const auto& beam : lasers) {
-        result += sample_beam(r, t_near, t_far, beam);
+        float d = distance_to_line(beam.origin, beam.direction, rec.p);
+        if (d >= beam.radius * 1.2f) continue;
+        float radial = 1.0f - d / (beam.radius * 1.2f);
+        radial = radial * radial;
+        result += beam.color * (radial * beam.intensity * 0.12f);
     }
     return result;
 }
@@ -340,49 +290,43 @@ color ray_color(const ray& r, const std::vector<laser_beam>& lasers) {
             case 0: surface = shade_gold(rec);   break;
             case 1: surface = shade_chrome(rec); break;
             case 2: surface = shade_visor(rec, unit_vector(r.direction())); break;
-            case 3: surface = shade_ground(rec); break;
-            default: surface = color(1, 0, 1);   break; // shouldn't happen
+            case 3: surface = shade_mouth(rec);  break;
+            case 4: surface = shade_ground(rec); break;
+            default: surface = color(1, 0, 1);   break;
         }
-        // Lasers also light the surface directly where the beam crosses it.
-        // Bias the lit color toward the surface color so the beams look like
-        // they are painting the helmet, not punching holes through it.
-        color laser_light(0, 0, 0);
-        for (const auto& beam : lasers) {
-            float d = distance_to_line(beam.origin, beam.direction, rec.p);
-            if (d < beam.radius * 2.0f) {
-                float radial = std::fmax(0.0f, 1.0f - d / (beam.radius * 2.0f));
-                radial = radial * radial;
-                color painted = 0.5f * surface + 0.5f * beam.color;
-                laser_light += painted * (radial * beam.intensity * 0.35f);
-            }
+
+        color light(0, 0, 0);
+        // The visor and mouth slit are opaque dark surfaces in the helmet
+        // design; they should not be lit by the lasers (either on the surface
+        // or by smoke passing in front of them).
+        if (rec.material != 2 && rec.material != 3) {
+            light += laser_surface_light(rec, lasers);
+            light += volumetric_lasers(r, 0.0f, rec.t, lasers);
         }
-        // Volumetric beams between camera and surface.
-        color volumetric = accumulate_lasers(r, 0.0f, rec.t, lasers);
-        return surface + laser_light + volumetric;
+
+        return surface + light;
     }
 
-    // Sky / no-hit path. The lasers still cut through the air here.
+    // No surface: just sky + volumetric beams.
     vec3 unit = unit_vector(r.direction());
     float a = 0.5f * (unit.y() + 1.0f);
-    color sky = (1.0f - a) * color(0.04f, 0.04f, 0.10f) + a * color(0.10f, 0.12f, 0.22f);
-    color volumetric = accumulate_lasers(r, 0.0f, 100.0f, lasers);
+    color sky = (1.0f - a) * color(0.03f, 0.03f, 0.08f) + a * color(0.08f, 0.09f, 0.18f);
+    color volumetric = volumetric_lasers(r, 0.0f, 100.0f, lasers);
     return sky + volumetric;
 }
 
 } // namespace
 
 int main() {
-    // Image
     auto aspect_ratio = 16.0 / 9.0;
-    int image_width = 800;
+    int image_width = 600;
     int image_height = int(image_width / aspect_ratio);
     image_height = (image_height < 1) ? 1 : image_height;
 
-    // Camera
-    auto focal_length = 1.8f;
-    auto viewport_height = 2.0f;
+    auto focal_length = 1.7f;
+    auto viewport_height = 1.4f;
     auto viewport_width = viewport_height * (float(image_width) / image_height);
-    auto camera_center = point3(0, 0.05f, 2.6f);
+    auto camera_center = point3(0, 0.15f, 2.0f);
 
     auto viewport_u = vec3(viewport_width, 0, 0);
     auto viewport_v = vec3(0, -viewport_height, 0);
@@ -391,14 +335,16 @@ int main() {
     auto viewport_upper_left = camera_center - vec3(0, 0, focal_length) - viewport_u / 2 - viewport_v / 2;
     auto pixel00_loc = viewport_upper_left + 0.5f * (pixel_delta_u + pixel_delta_v);
 
-    // Lasers: a few cross-cutting beams for the smoke-show effect.
+    // Lasers: a smoke-show spread. Mix of cross-cutting horizontals and
+    // diagonals, all converging roughly on the helmet area.
     std::vector<laser_beam> lasers = {
-        { point3(-3.5f,  0.0f, -2.0f), unit_vector(vec3( 1.0f, -0.05f,  0.4f)), color(1.0f, 0.10f, 0.20f), 0.20f, 2.5f },
-        { point3( 3.5f,  0.2f, -2.0f), unit_vector(vec3(-1.0f, -0.10f,  0.4f)), color(0.10f, 0.45f, 1.0f), 0.20f, 2.5f },
-        { point3( 0.0f,  1.8f, -3.5f), unit_vector(vec3( 0.05f, -0.60f, 1.0f)), color(0.10f, 0.95f, 0.70f), 0.18f, 2.0f },
+        { point3(-4.0f,  0.2f, -0.5f), unit_vector(vec3( 1.0f, -0.05f, -0.2f)), color(1.0f, 0.10f, 0.25f), 0.30f, 12.0f },
+        { point3( 4.0f,  0.3f, -0.5f), unit_vector(vec3(-1.0f, -0.05f, -0.2f)), color(0.10f, 0.50f, 1.0f), 0.30f, 12.0f },
+        { point3(-3.0f,  1.5f, -2.5f), unit_vector(vec3( 0.6f, -0.30f,  0.6f)), color(0.20f, 1.00f, 0.50f), 0.25f, 8.0f },
+        { point3( 3.0f,  1.4f, -2.5f), unit_vector(vec3(-0.6f, -0.30f,  0.6f)), color(1.00f, 0.20f, 1.00f), 0.25f, 8.0f },
+        { point3( 0.0f,  2.0f, -3.0f), unit_vector(vec3( 0.05f,-0.50f, 1.0f)), color(0.10f, 0.95f, 0.80f), 0.30f, 8.0f },
     };
 
-    // Render
     std::cout << "P3\n" << image_width << ' ' << image_height << "\n255\n";
 
     for (int j = 0; j < image_height; j++) {
@@ -408,13 +354,12 @@ int main() {
             auto ray_direction = pixel_center - camera_center;
             ray r(camera_center, ray_direction);
             color pixel_color = ray_color(r, lasers);
-            // Simple Reinhard tonemap so highlights don't clip to white.
+            // Reinhard tonemap.
             color mapped(
                 pixel_color.x() / (1.0f + pixel_color.x()),
                 pixel_color.y() / (1.0f + pixel_color.y()),
                 pixel_color.z() / (1.0f + pixel_color.z()));
-            // Mild gamma and exposure bump.
-            mapped = mapped * 1.6f;
+            mapped = mapped * 1.5f;
             write_color(std::cout, mapped);
         }
     }
